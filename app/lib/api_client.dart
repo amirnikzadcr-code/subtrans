@@ -255,6 +255,8 @@ Future<TranscriptResult> fetchTranscriptWithTranslation({
     final yt = await YouTubeClient().fetchTranscript(videoId);
     title = yt.title;
     author = yt.author;
+    sourceLang = yt.sourceLang;
+    isAsr = yt.isAsr;
     final tr = await api.translateTexts(yt.segments.map((s) => s.text).toList(), target);
     segments = List.generate(
       yt.segments.length,

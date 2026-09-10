@@ -36,7 +36,52 @@ function ok(obj) {
 // ---------------------------------------------------------------------------
 // YouTube: player response via InnerTube (multi-client), watch-page fallback
 // ---------------------------------------------------------------------------
+// NOTE (2026-09): YouTube now hard-rejects older client versions with HTTP 400
+// ("ANDROID 19.x" / "IOS 19.x" are dead). Versions below are verified live.
+// IOS first — its caption baseUrls still honor fmt=json3; Android clients
+// return srv3 XML, which we also parse (see parseSrv3).
 const CLIENTS = [
+  {
+    name: "IOS",
+    url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)",
+      "X-YouTube-Client-Name": "5",
+      "X-YouTube-Client-Version": "20.10.4",
+    },
+    context: {
+      client: {
+        clientName: "IOS",
+        clientVersion: "20.10.4",
+        deviceMake: "Apple",
+        deviceModel: "iPhone16,2",
+        osName: "iPhone",
+        osVersion: "18.1.0.22B83",
+        hl: "en",
+        gl: "US",
+      },
+    },
+  },
+  {
+    name: "ANDROID",
+    url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+      "X-YouTube-Client-Name": "3",
+      "X-YouTube-Client-Version": "20.10.38",
+    },
+    context: {
+      client: {
+        clientName: "ANDROID",
+        clientVersion: "20.10.38",
+        androidSdkVersion: 34,
+        hl: "en",
+        gl: "US",
+      },
+    },
+  },
   {
     name: "ANDROID_VR",
     url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
@@ -55,47 +100,6 @@ const CLIENTS = [
         osName: "Android",
         osVersion: "12L",
         androidSdkVersion: "32",
-        hl: "en",
-        gl: "US",
-      },
-    },
-  },
-  {
-    name: "ANDROID",
-    url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "com.google.android.youtube/19.44.38 (Linux; U; Android 11) gzip",
-      "X-YouTube-Client-Name": "3",
-      "X-YouTube-Client-Version": "19.44.38",
-    },
-    context: {
-      client: {
-        clientName: "ANDROID",
-        clientVersion: "19.44.38",
-        androidSdkVersion: 30,
-        hl: "en",
-        gl: "US",
-      },
-    },
-  },
-  {
-    name: "IOS",
-    url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
-      "X-YouTube-Client-Name": "5",
-      "X-YouTube-Client-Version": "19.45.4",
-    },
-    context: {
-      client: {
-        clientName: "IOS",
-        clientVersion: "19.45.4",
-        deviceMake: "Apple",
-        deviceModel: "iPhone16,2",
-        osName: "iPhone",
-        osVersion: "18.1.0.22B83",
         hl: "en",
         gl: "US",
       },
@@ -187,12 +191,18 @@ async function tryClient(c, videoId) {
   }
 }
 
+// Returns { j, client } — client is kept so the caption download can reuse
+// the SAME User-Agent that minted the baseUrl (timedtext is UA-sensitive).
 async function getPlayerResponse(videoId) {
   let watchFallback = null;
+  let watchClient = null;
   for (const c of CLIENTS) {
     const r = await tryClient(c, videoId);
-    if (r.j && r.hasCaptions) return r.j;
-    if (r.j && r.hasDetails && !watchFallback) watchFallback = r.j;
+    if (r.j && r.hasCaptions) return { j: r.j, client: c };
+    if (r.j && r.hasDetails && !watchFallback) {
+      watchFallback = r.j;
+      watchClient = c;
+    }
   }
 
   // Watch page fallback
@@ -209,11 +219,12 @@ async function getPlayerResponse(videoId) {
     if (m) {
       try {
         const j = JSON.parse(m[1]);
-        if (j && (j.videoDetails || j.captions)) return j;
+        if (j && (j.videoDetails || j.captions))
+          return { j, client: { name: "WATCH_PAGE", headers: { "User-Agent": UA_DESKTOP } } };
       } catch {}
     }
   }
-  return watchFallback;
+  return watchFallback ? { j: watchFallback, client: watchClient } : null;
 }
 
 function playabilityError(pr) {
@@ -269,58 +280,93 @@ function decodeEntities(s) {
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
 }
 
-async function fetchSegments(track) {
-  const variants = [
-    { url: track.baseUrl + (track.baseUrl.includes("?") ? "&" : "?") + "fmt=json3", xml: false, ua: true },
-    { url: track.baseUrl, xml: true, ua: true },
-    { url: track.baseUrl + (track.baseUrl.includes("?") ? "&" : "?") + "fmt=json3", xml: false, ua: false },
-  ];
+// srv3 XML (innertube mobile clients): <p t="1200" d="3400"><s>word</s>…</p>
+function parseSrv3(body) {
+  const segs = [];
+  const re = /<p t="(\d+)"(?: d="(\d+)")?[^>]*>([\s\S]*?)<\/p>/g;
+  let m;
+  while ((m = re.exec(body))) {
+    const text = decodeEntities(m[3].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    segs.push({ start: parseInt(m[1], 10) || 0, dur: parseInt(m[2] || "3000", 10) || 3000, text });
+  }
+  return segs;
+}
+
+// legacy XML (watch page / timedtext classic): <text start="1.2" dur="3.4">…</text>
+function parseLegacyXml(body) {
+  const segs = [];
+  const re = /<text start="([\d.]+)"(?: dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g;
+  let m;
+  while ((m = re.exec(body))) {
+    const text = decodeEntities(m[3].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    segs.push({
+      start: Math.round(parseFloat(m[1]) * 1000),
+      dur: Math.round(parseFloat(m[2] || "3") * 1000),
+      text,
+    });
+  }
+  return segs;
+}
+
+function parseJson3(body) {
+  const j = JSON.parse(body);
+  const segs = [];
+  for (const e of j.events || []) {
+    if (!e.segs) continue;
+    const text = e.segs
+      .map((s) => s.utf8 || "")
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) continue;
+    segs.push({ start: e.tStartMs || 0, dur: e.dDurationMs || 0, text });
+  }
+  return segs;
+}
+
+// Timedtext download — MUST try the UA of the client that minted the baseUrl
+// first (timedtext is UA/IP-session sensitive), across all three wire formats.
+async function fetchSegments(track, ua) {
+  const agents = [
+    ua,
+    "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)",
+    UA_DESKTOP,
+  ].filter(Boolean);
+  const seenUa = new Set();
   let lastErr = null;
-  for (const v of variants) {
-    try {
-      const res = await fetch(v.url, {
-        headers: v.ua
-          ? {
-              "User-Agent": "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-              Referer: "https://www.youtube.com/",
-            }
-          : { "User-Agent": UA_DESKTOP, Referer: "https://www.youtube.com/" },
-      });
-      if (!res.ok) {
-        lastErr = new Error("caption_http_" + res.status);
-        continue;
-      }
-      const body = await res.text();
-      let segs = [];
-      if (!v.xml) {
-        const j = JSON.parse(body);
-        for (const e of j.events || []) {
-          if (!e.segs) continue;
-          const text = e.segs
-            .map((s) => s.utf8 || "")
-            .join("")
-            .replace(/\s+/g, " ")
-            .trim();
-          if (!text) continue;
-          segs.push({ start: e.tStartMs || 0, dur: e.dDurationMs || 0, text });
+  for (const agent of agents) {
+    if (seenUa.has(agent)) continue;
+    seenUa.add(agent);
+    const base = track.baseUrl;
+    const urls = [
+      base + (base.includes("?") ? "&" : "?") + "fmt=json3",
+      base,
+      base + (base.includes("?") ? "&" : "?") + "fmt=srv3",
+    ];
+    for (const u of urls) {
+      try {
+        const res = await fetch(u, {
+          headers: { "User-Agent": agent, Referer: "https://www.youtube.com/" },
+        });
+        if (!res.ok) {
+          lastErr = new Error("caption_http_" + res.status);
+          continue;
         }
-      } else {
-        const re = /<text start="([\d.]+)"(?: dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g;
-        let m;
-        while ((m = re.exec(body))) {
-          const text = decodeEntities(m[3].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
-          if (!text) continue;
-          segs.push({
-            start: Math.round(parseFloat(m[1]) * 1000),
-            dur: Math.round(parseFloat(m[2] || "3") * 1000),
-            text,
-          });
+        const body = await res.text();
+        let segs = [];
+        const trimmed = body.trim();
+        if (trimmed.startsWith("{")) segs = parseJson3(trimmed);
+        else if (trimmed.startsWith("<")) {
+          segs = parseSrv3(trimmed);
+          if (!segs.length) segs = parseLegacyXml(trimmed);
         }
+        if (segs.length) return mergeSegments(segs);
+        lastErr = new Error("caption_empty");
+      } catch (e) {
+        lastErr = e;
       }
-      if (segs.length) return mergeSegments(segs);
-      lastErr = new Error("caption_empty");
-    } catch (e) {
-      lastErr = e;
     }
   }
   throw lastErr || new Error("caption_failed");
@@ -518,9 +564,44 @@ async function getTranscriptWithParams(params, visitorData) {
   return raw;
 }
 
-// fetch transcript: /next-minted params first, then manual params, then timedtext
-async function fetchTranscriptSegments(pr, videoId, wantLang) {
-  // 1) minted params via /next
+// fetch transcript: timedtext with the winning client's UA first (verified
+// working when client versions are current), then fresh player responses
+// from the remaining clients (each UA-bound), then get_transcript last.
+async function fetchTranscriptSegments(win, videoId, wantLang) {
+  const pr = win.j;
+  const triedClients = new Set([win.client?.name].filter(Boolean));
+
+  const attemptTracks = async (prObj, ua) => {
+    const tracks = prObj?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const manual = tracks.filter((t) => t.kind !== "asr");
+    const asrTracks = tracks.filter((t) => t.kind === "asr");
+    const wanted = wantLang ? tracks.filter((t) => t.languageCode === wantLang) : [];
+    const ordered = [...wanted, ...manual.filter((t) => !wanted.includes(t)), ...asrTracks];
+    for (const t of ordered) {
+      try {
+        return await fetchSegments(t, ua);
+      } catch (e) {
+        // try next track
+      }
+    }
+    return null;
+  };
+
+  // 1) timedtext straight from the winning player response
+  const first = await attemptTracks(pr, win.client?.headers?.["User-Agent"]);
+  if (first) return first;
+
+  // 2) fresh player responses from the remaining clients (each UA-bound)
+  for (const c of CLIENTS) {
+    if (triedClients.has(c.name)) continue;
+    triedClients.add(c.name);
+    const r = await tryClient(c, videoId);
+    if (!r.j || !r.hasCaptions) continue;
+    const segs = await attemptTracks(r.j, c.headers["User-Agent"]);
+    if (segs) return segs;
+  }
+
+  // 3) get_transcript (minted via /next, then manual params) — last resort
   try {
     const ep = await getTranscriptEndpointParams(videoId);
     if (ep.params) {
@@ -530,24 +611,10 @@ async function fetchTranscriptSegments(pr, videoId, wantLang) {
   } catch (e) {
     // fall through
   }
-
-  // 2) caption tracks + timedtext fallback
-  const tracks = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  const manual = tracks.filter((t) => t.kind !== "asr");
-  const asrTracks = tracks.filter((t) => t.kind === "asr");
-  const ordered = [...manual, ...asrTracks];
-
-  for (const t of ordered) {
+  for (const t of pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || []) {
     try {
       const segs = await getTranscript(videoId, t.languageCode, t.kind === "asr" ? "asr" : "", t.vssId, pr?.responseContext?.visitorData);
       if (segs.length) return mergeSegments(segs);
-    } catch (e) {
-      // try next
-    }
-  }
-  for (const t of ordered) {
-    try {
-      return await fetchSegments(t);
     } catch (e) {
       // try next
     }
@@ -664,7 +731,8 @@ export default {
 
     // --- youtube_asr_languages: list available caption languages
     if (action === "youtube_asr_languages") {
-      const pr = await getPlayerResponse(videoId);
+      const win = await getPlayerResponse(videoId);
+      const pr = win?.j;
       if (!pr) return err("transcript_fetch_failed", 502, "Could not fetch player response");
       const pe = playabilityError(pr);
       if (pe) return err(pe, 422, "Video cannot be transcribed");
@@ -695,7 +763,8 @@ export default {
       const hit = await cache.match(cacheKey);
       if (hit) return hit;
 
-      const pr = await getPlayerResponse(videoId);
+      const win = await getPlayerResponse(videoId);
+      const pr = win?.j;
       if (!pr) return err("transcript_fetch_failed", 502, "Could not fetch player response");
       const pe = playabilityError(pr);
       if (pe) return err(pe, 422, "Video cannot be transcribed");
@@ -705,7 +774,7 @@ export default {
 
       let segments;
       try {
-        segments = await fetchTranscriptSegments(pr, videoId, wantLang);
+        segments = await fetchTranscriptSegments(win, videoId, wantLang);
       } catch (e) {
         return err("transcript_fetch_failed", 502, "Caption download failed");
       }

@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -43,13 +46,40 @@ jobs:
         working-directory: app
         run: flutter pub get
 
+      - name: Analyze (non-blocking)
+        working-directory: app
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos || true
+
       - name: Build release APK
         working-directory: app
         run: flutter build apk --release
 
+      - name: Copy APK
+        run: |
+          mkdir -p dist
+          cp app/build/app/outputs/flutter-apk/app-release.apk dist/SubTrans-v${{ github.run_number }}.apk
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: subtrans-apk
-          path: app/build/app/outputs/flutter-apk/app-release.apk
+          name: subtrans-apk-${{ github.run_number }}
+          path: dist/*.apk
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: SubTrans v1.0.${{ github.run_number }}
+          body: |
+            ## SubTrans — YouTube subtitle translation (130+ languages)
+
+            **What's new**
+            - Fixed 502: transcript fetching rebuilt (current YouTube clients + all caption formats)
+            - In-app video player with live synced subtitles (translated + original)
+            - Tap any transcript line to seek the video
+
+            **Install**: download `SubTrans-v*.apk`, allow "install unknown apps", install.
+            Requires YouTube access (VPN in restricted regions).
+          files: dist/*.apk
+          make_latest: true
