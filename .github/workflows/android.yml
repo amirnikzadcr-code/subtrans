@@ -75,8 +75,9 @@ jobs:
             ## SubTrans — YouTube subtitle translation (130+ languages)
 
             **What's new**
-            - Fixed 502: transcript fetching rebuilt (current YouTube clients + all caption formats)
-            - In-app video player with live synced subtitles (translated + original)
+            - 🎬 Native in-app player: plays EVERY video (even ones that block embedding) — direct stream playback like YouTube's own apps. No more "Watch on YouTube" error screen.
+            - Fullscreen mode, scrub bar, mute, auto-hiding controls
+            - Synced translated subtitles stay burned on top of the video
             - Tap any transcript line to seek the video
 
             **Install**: download `SubTrans-v*.apk`, allow "install unknown apps", install.
