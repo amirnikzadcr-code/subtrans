@@ -1,0 +1,18 @@
+# Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins*
+.pub-cache/
+.pub/
+coverage/
+# IDE
+.idea/
+*.iml
+.vscode/
+# Node
+node_modules/
+.wrangler/
+# Misc
+*.log
+.DS_Store

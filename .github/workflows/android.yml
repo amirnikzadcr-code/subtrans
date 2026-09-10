@@ -1,0 +1,55 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Generate Android platform scaffold
+        working-directory: app
+        run: flutter create . --platforms=android --org com.subtrans --project-name subtrans
+
+      - name: Patch Android manifest (INTERNET + label)
+        working-directory: app
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.INTERNET" $M || \
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' $M
+          sed -i 's|android:label="subtrans"|android:label="SubTrans"|' $M
+
+      - name: Pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: app
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtrans-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

@@ -1,0 +1,7 @@
+name = "subtrans-api"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Optional: add Gemini as primary translation engine later with:
+#   npx wrangler secret put GEMINI_API_KEY
+# Without it the Worker uses the keyless gtx fallback (130+ languages).
