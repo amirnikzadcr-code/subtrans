@@ -4,19 +4,21 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:video_player/video_player.dart';
+import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
 import '../api_client.dart';
 import '../languages.dart';
 import '../youtube_client.dart';
 import 'lang_picker.dart';
 
-/// Video + transcript view — native playback, same UX pattern as the original
-/// app: the video plays INSIDE the app (direct stream URLs minted from
-/// innertube, like YouTube's own mobile apps — works for every video,
-/// including ones that forbid embedding), with the selected subtitle rendered
-/// as a synced overlay (translated line big, original line small), sticky
-/// video header, language switch, tap-a-line → seek, copy & share.
+/// Video + transcript view — same playback mechanism as the ORIGINAL app
+/// (verified from its APK): the `youtube_player_flutter` WebView player whose
+/// page is served with a youtube-nocookie.com base origin, so YouTube's
+/// IFrame player treats the embed as coming from YouTube's own domain and
+/// NEVER shows "Watch on YouTube" / "embedding disabled" errors. Every video
+/// plays in-app, with the selected subtitle rendered as a synced overlay
+/// (translated line big, original line small), sticky header, language
+/// switch, tap-a-line → seek, copy & share.
 class VideoScreen extends StatefulWidget {
   final TranscriptResult result;
   const VideoScreen({super.key, required this.result});
@@ -24,12 +26,9 @@ class VideoScreen extends StatefulWidget {
   State<VideoScreen> createState() => _VideoScreenState();
 }
 
-enum _PlayState { loading, ready, failed }
-
 class _VideoScreenState extends State<VideoScreen> {
   late TranscriptResult _result;
-  _PlayState _playState = _PlayState.loading;
-  String _failCode = '';
+  late YoutubePlayerController _player;
   bool _showSource = true;
   bool _showSubtitles = true;
   bool _switching = false;
@@ -38,124 +37,110 @@ class _VideoScreenState extends State<VideoScreen> {
   bool _muted = false;
   int _activeIdx = -1;
   int _activeHint = 0;
+  int _playError = 0;
+  bool _wasPlaying = false;
   Timer? _hideTimer;
-
-  VideoPlayerController? _vc;
+  final GlobalKey _playerKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
     _result = widget.result;
-    _openPlayer();
+    _createPlayer();
   }
 
-  // ---- native playback: innertube stream URLs → ExoPlayer -------------------
-  Future<void> _openPlayer() async {
+  // ---- player (exact stack of the original app) -----------------------------
+  void _createPlayer() {
+    _player = YoutubePlayerController(
+      initialVideoId: _result.videoId,
+      flags: const YoutubePlayerFlags(
+        autoPlay: true,
+        mute: false,
+        hideControls: true, // we render our own controls + subtitle overlay
+        controlsVisibleAtStart: false,
+        enableCaption: false, // we render our own translated subtitles
+        disableDragSeek: false,
+        forceHD: false,
+        useHybridComposition: true,
+      ),
+    );
+    _player.addListener(_onPlayerValue);
+  }
+
+  void _recreatePlayer() {
+    _player.removeListener(_onPlayerValue);
+    _player.dispose();
     setState(() {
-      _playState = _PlayState.loading;
-      _failCode = '';
+      _playError = 0;
+      _activeIdx = -1;
+      _activeHint = 0;
+      _controlsVisible = true;
     });
-    await _disposePlayer();
-    try {
-      // 1) mint direct stream URLs from the device (residential IP) — this is
-      //    what makes playback work for videos that block embedding.
-      final stream = await YouTubeClient().fetchStreamInfo(_result.videoId);
-      // 2) native player (ExoPlayer) — HLS adaptive or progressive mp4
-      final vc = VideoPlayerController.networkUrl(
-        Uri.parse(stream.url),
-        httpHeaders: {'User-Agent': YouTubeClient.playbackUa},
-      );
-      _vc = vc;
-      vc.addListener(_onTick);
-      await vc.initialize();
-      if (!mounted) {
-        await vc.dispose();
-        return;
-      }
-      setState(() => _playState = _PlayState.ready);
-      await vc.play();
-      _armControlsHide();
-    } on YtFetchException catch (e) {
-      if (mounted) {
-        setState(() {
-          _playState = _PlayState.failed;
-          _failCode = e.code;
-        });
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _playState = _PlayState.failed;
-          _failCode = 'playback_failed';
-        });
-      }
-    }
+    _createPlayer();
   }
 
-  Future<void> _disposePlayer() async {
-    _vc?.removeListener(_onTick);
-    final old = _vc;
-    _vc = null;
-    await old?.dispose();
-  }
+  /// controller ticks (every ~100ms) → subtitle sync, fullscreen transitions,
+  /// error surfacing, control auto-hide. Only setState when something visible
+  /// changed so the transcript list doesn't rebuild every tick.
+  void _onPlayerValue() {
+    if (!mounted) return;
+    final v = _player.value;
 
-  bool _lastPlaying = false;
-  bool _lastBuffering = false;
-
-  /// position ticks → subtitle sync + control-state refresh (only setState
-  /// when something visible actually changed, so the transcript list doesn't
-  /// rebuild on every frame)
-  void _onTick() {
-    final vc = _vc;
-    if (vc == null || !mounted) return;
-    final v = vc.value;
-    if (v.hasError && _playState == _PlayState.ready) {
-      setState(() {
-        _playState = _PlayState.failed;
-        _failCode = 'playback_failed';
-      });
+    if (v.hasError && _playError == 0) {
+      setState(() => _playError = v.errorCode);
       return;
     }
+
+    if (v.isFullScreen != _fullscreen) {
+      setState(() => _fullscreen = v.isFullScreen);
+      SystemChrome.setEnabledSystemUIMode(
+        _fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+      );
+    }
+
     final idx = activeSegmentIndex(_result.segments, v.position.inMilliseconds, _activeHint);
-    final playing = v.isPlaying;
-    final buffering = v.isBuffering;
-    if (idx != _activeIdx || playing != _lastPlaying || buffering != _lastBuffering) {
+    if (idx != _activeIdx) {
       setState(() {
         _activeIdx = idx;
         if (idx >= 0) _activeHint = idx;
-        _lastPlaying = playing;
-        _lastBuffering = buffering;
       });
     }
-  }
 
-  bool get _isPlaying => _vc?.value.isPlaying ?? false;
-  bool get _isBuffering => _vc?.value.isBuffering ?? false;
-
-  void _toggleMute() {
-    final vc = _vc;
-    if (vc == null) return;
-    _muted = !_muted;
-    vc.setVolume(_muted ? 0 : 1);
-    setState(() {});
-    _armControlsHide();
+    if (v.isPlaying != _wasPlaying) {
+      _wasPlaying = v.isPlaying;
+      if (v.isPlaying) {
+        _armControlsHide();
+      } else if (!_controlsVisible) {
+        setState(() => _controlsVisible = true);
+      } else {
+        setState(() {});
+      }
+    }
   }
 
   void _togglePlay() {
-    final vc = _vc;
-    if (vc == null) return;
-    if (vc.value.isPlaying) {
-      vc.pause();
+    if (_player.value.isPlaying) {
+      _player.pause();
     } else {
-      vc.play();
+      _player.play();
     }
+    _armControlsHide();
+  }
+
+  void _toggleMute() {
+    if (_muted) {
+      _player.unMute();
+    } else {
+      _player.mute();
+    }
+    setState(() => _muted = !_muted);
     _armControlsHide();
   }
 
   void _armControlsHide() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted && (_vc?.value.isPlaying ?? false)) {
+      if (mounted && _player.value.isPlaying && _controlsVisible) {
         setState(() => _controlsVisible = false);
       }
     });
@@ -166,24 +151,9 @@ class _VideoScreenState extends State<VideoScreen> {
     _armControlsHide();
   }
 
-  Future<void> _toggleFullscreen() async {
-    final vc = _vc;
-    if (vc == null) return;
-    if (!_fullscreen) {
-      await SystemChrome.setPreferredOrientations(
-          [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      setState(() => _fullscreen = true);
-    } else {
-      await _exitFullscreen();
-    }
+  void _toggleFullscreen() {
     _pokeControls();
-  }
-
-  Future<void> _exitFullscreen() async {
-    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    if (mounted) setState(() => _fullscreen = false);
+    _player.toggleFullScreenMode();
   }
 
   @override
@@ -191,8 +161,8 @@ class _VideoScreenState extends State<VideoScreen> {
     _hideTimer?.cancel();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    _vc?.removeListener(_onTick);
-    _vc?.dispose();
+    _player.removeListener(_onPlayerValue);
+    _player.dispose();
     super.dispose();
   }
 
@@ -252,10 +222,8 @@ class _VideoScreenState extends State<VideoScreen> {
   }
 
   void _seekTo(Segment s) {
-    final vc = _vc;
-    if (vc == null) return;
-    vc.seekTo(Duration(milliseconds: s.start));
-    vc.play();
+    _player.seekTo(Duration(milliseconds: s.start));
+    _player.play();
     _pokeControls();
   }
 
@@ -272,6 +240,22 @@ class _VideoScreenState extends State<VideoScreen> {
     }
   }
 
+  String get _playerErrorMessage {
+    switch (_playError) {
+      case 2:
+        return 'ویدئوی موردنظر معتبر نیست.';
+      case 100:
+        return 'ویدئو پیدا نشد یا حذف شده است.';
+      case 101:
+      case 150:
+        return 'سازنده این ویدئو اجازه پخش داخل اپ را نداده است.';
+      case 5:
+        return 'پخش‌کننده ویدئو خطا داد؛ دوباره تلاش کن.';
+      default:
+        return 'پخش این ویدئو ممکن نشد؛ زیرنویس همچنان کار می‌کند.';
+    }
+  }
+
   // ---- build ----------------------------------------------------------------
 
   @override
@@ -279,169 +263,188 @@ class _VideoScreenState extends State<VideoScreen> {
     final cs = Theme.of(context).colorScheme;
     final srcLang = langByCode(_result.sourceLang);
 
-    if (_fullscreen) {
-      return PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop) _exitFullscreen();
-        },
-        child: Scaffold(
-          backgroundColor: Colors.black,
-          body: _playerArea(fullscreen: true),
-        ),
-      );
-    }
+    final playerBlock = SizedBox(
+      key: _playerKey,
+      child: _playerStack(),
+    );
 
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          _result.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 16),
+    final body = Column(
+      children: [
+        if (_fullscreen) Expanded(child: playerBlock) else playerBlock,
+        // sticky header — meta + language switch
+        Container(
+          color: cs.surfaceContainerHighest.withAlpha(60),
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+          child: Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  'https://i.ytimg.com/vi/${_result.videoId}/mqdefault.jpg',
+                  width: 96, height: 54, fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                    width: 96, height: 54, color: Colors.black26,
+                    child: const Icon(Icons.videocam_off),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(_result.author,
+                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${_result.segments.length} خط'
+                      ' · ${srcLang.flag} ${srcLang.fa}'
+                      '${_result.isAsr ? ' · خودکار (ASR)' : ' · دستی'}'
+                      '${_result.engine != null ? ' · ${_result.engine == "gemini" ? "Gemini" : "Google"}' : ''}',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
-        actions: [
-          IconButton(onPressed: _copyAll, icon: const Icon(Icons.copy_all)),
-          IconButton(onPressed: _shareAll, icon: const Icon(Icons.share)),
-        ],
+        // language switch row
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+          child: Row(
+            children: [
+              InkWell(
+                borderRadius: BorderRadius.circular(24),
+                onTap: _changeLanguage,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: cs.primaryContainer,
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('${_current.flag} ${_current.fa}',
+                          style: TextStyle(color: cs.onPrimaryContainer,
+                              fontWeight: FontWeight.w700)),
+                      const SizedBox(width: 6),
+                      Icon(Icons.swap_horiz, size: 18, color: cs.onPrimaryContainer),
+                    ],
+                  ),
+                ),
+              ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: () => setState(() => _showSubtitles = !_showSubtitles),
+                icon: Icon(_showSubtitles ? Icons.subtitles : Icons.subtitles_off, size: 18),
+                label: const Text('زیرنویس'),
+              ),
+              TextButton.icon(
+                onPressed: () => setState(() => _showSource = !_showSource),
+                icon: Icon(_showSource ? Icons.visibility : Icons.visibility_off, size: 18),
+                label: const Text('متن اصلی'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView.separated(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 24),
+            itemCount: _result.segments.length,
+            separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
+            itemBuilder: (context, i) {
+              final s = _result.segments[i];
+              final isActive = i == _activeIdx;
+              return InkWell(
+                onTap: () => _seekTo(s),
+                child: Container(
+                  color: isActive
+                      ? cs.primary.withAlpha(30)
+                      : Colors.transparent,
+                  padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        Icon(Icons.play_circle_outline, size: 14, color: cs.primary),
+                        const SizedBox(width: 4),
+                        Text(s.tc, style: TextStyle(
+                            fontSize: 11, fontWeight: FontWeight.w700,
+                            color: cs.primary, letterSpacing: 0.5)),
+                      ]),
+                      const SizedBox(height: 4),
+                      if (_showSource)
+                        Text(s.text,
+                            style: TextStyle(fontSize: 12.5,
+                                color: cs.onSurfaceVariant, height: 1.5)),
+                      Text(s.tr.isEmpty ? '—' : s.tr,
+                          style: TextStyle(fontSize: 15, height: 1.7,
+                              fontWeight: FontWeight.w600,
+                              color: isActive ? cs.primary : null)),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+
+    return PopScope(
+      canPop: !_fullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _fullscreen) _toggleFullscreen();
+      },
+      child: Scaffold(
+        backgroundColor: _fullscreen ? Colors.black : null,
+        appBar: _fullscreen
+            ? null
+            : AppBar(
+                title: Text(
+                  _result.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 16),
+                ),
+                actions: [
+                  IconButton(onPressed: _copyAll, icon: const Icon(Icons.copy_all)),
+                  IconButton(onPressed: _shareAll, icon: const Icon(Icons.share)),
+                ],
+              ),
+        body: Stack(
+          children: [
+            body,
+            if (_switching)
+              const Positioned.fill(
+                child: ColoredBox(
+                  color: Colors.black38,
+                  child: Center(child: CircularProgressIndicator()),
+                ),
+              ),
+          ],
+        ),
       ),
-      body: _switching
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                _playerArea(),
-                // sticky header — meta + language switch
-                Container(
-                  color: cs.surfaceContainerHighest.withAlpha(60),
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-                  child: Row(
-                    children: [
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(10),
-                        child: Image.network(
-                          'https://i.ytimg.com/vi/${_result.videoId}/mqdefault.jpg',
-                          width: 96, height: 54, fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) => Container(
-                            width: 96, height: 54, color: Colors.black26,
-                            child: const Icon(Icons.videocam_off),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(_result.author,
-                                maxLines: 1, overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontWeight: FontWeight.w700)),
-                            const SizedBox(height: 2),
-                            Text(
-                              '${_result.segments.length} خط'
-                              ' · ${srcLang.flag} ${srcLang.fa}'
-                              '${_result.isAsr ? ' · خودکار (ASR)' : ' · دستی'}'
-                              '${_result.engine != null ? ' · ${_result.engine == "gemini" ? "Gemini" : "Google"}' : ''}',
-                              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                // language switch row
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-                  child: Row(
-                    children: [
-                      InkWell(
-                        borderRadius: BorderRadius.circular(24),
-                        onTap: _changeLanguage,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: cs.primaryContainer,
-                            borderRadius: BorderRadius.circular(24),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text('${_current.flag} ${_current.fa}',
-                                  style: TextStyle(color: cs.onPrimaryContainer,
-                                      fontWeight: FontWeight.w700)),
-                              const SizedBox(width: 6),
-                              Icon(Icons.swap_horiz, size: 18, color: cs.onPrimaryContainer),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const Spacer(),
-                      TextButton.icon(
-                        onPressed: () => setState(() => _showSubtitles = !_showSubtitles),
-                        icon: Icon(_showSubtitles ? Icons.subtitles : Icons.subtitles_off, size: 18),
-                        label: const Text('زیرنویس'),
-                      ),
-                      TextButton.icon(
-                        onPressed: () => setState(() => _showSource = !_showSource),
-                        icon: Icon(_showSource ? Icons.visibility : Icons.visibility_off, size: 18),
-                        label: const Text('متن اصلی'),
-                      ),
-                    ],
-                  ),
-                ),
-                Expanded(
-                  child: ListView.separated(
-                    padding: const EdgeInsets.fromLTRB(16, 6, 16, 24),
-                    itemCount: _result.segments.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
-                    itemBuilder: (context, i) {
-                      final s = _result.segments[i];
-                      final isActive = i == _activeIdx;
-                      return InkWell(
-                        onTap: () => _seekTo(s),
-                        child: Container(
-                          color: isActive
-                              ? cs.primary.withAlpha(30)
-                              : Colors.transparent,
-                          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(children: [
-                                Icon(Icons.play_circle_outline, size: 14, color: cs.primary),
-                                const SizedBox(width: 4),
-                                Text(s.tc, style: TextStyle(
-                                    fontSize: 11, fontWeight: FontWeight.w700,
-                                    color: cs.primary, letterSpacing: 0.5)),
-                              ]),
-                              const SizedBox(height: 4),
-                              if (_showSource)
-                                Text(s.text,
-                                    style: TextStyle(fontSize: 12.5,
-                                        color: cs.onSurfaceVariant, height: 1.5)),
-                              Text(s.tr.isEmpty ? '—' : s.tr,
-                                  style: TextStyle(fontSize: 15, height: 1.7,
-                                      fontWeight: FontWeight.w600,
-                                      color: isActive ? cs.primary : null)),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
     );
   }
 
-  /// player surface — portrait: 16:9 block at top; fullscreen: whole body.
-  Widget _playerArea({bool fullscreen = false}) {
-    final vc = _vc;
-    Widget surface;
-    if (_playState == _PlayState.ready && vc != null && vc.value.isInitialized) {
-      final ar = vc.value.aspectRatio <= 0 ? 16 / 9 : vc.value.aspectRatio;
-      surface = GestureDetector(
+  /// player surface: 16:9 video + translated subtitle overlay + own controls.
+  /// The same keyed subtree is reparented (GlobalKey) between portrait block
+  /// and fullscreen Expanded, so the WebView never restarts.
+  Widget _playerStack() {
+    Widget video;
+    if (_playError != 0) {
+      video = _PlayerErrorCard(
+        videoId: _result.videoId,
+        message: _playerErrorMessage,
+        onOpenYouTube: _openInYouTube,
+        onRetry: _recreatePlayer,
+      );
+    } else {
+      video = GestureDetector(
         onTap: () {
           if (_controlsVisible) {
             _togglePlay();
@@ -449,63 +452,42 @@ class _VideoScreenState extends State<VideoScreen> {
             _pokeControls();
           }
         },
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            Center(child: AspectRatio(aspectRatio: ar, child: VideoPlayer(vc))),
-            if (_isBuffering)
-              const CircularProgressIndicator(color: Colors.white),
-            if (!_controlsVisible)
-              const SizedBox.expand(),
-          ],
-        ),
-      );
-    } else if (_playState == _PlayState.failed) {
-      surface = _PlayerErrorCard(
-        videoId: _result.videoId,
-        message: friendlyError(_failCode),
-        onOpenYouTube: _openInYouTube,
-        onRetry: _openPlayer,
-      );
-    } else {
-      surface = Stack(
-        alignment: Alignment.center,
-        children: [
-          Image.network(
-            'https://i.ytimg.com/vi/${_result.videoId}/hqdefault.jpg',
-            fit: BoxFit.cover,
-            errorBuilder: (_, __, ___) => Container(color: Colors.black),
+        child: Center(
+          child: AspectRatio(
+            aspectRatio: 16 / 9,
+            child: YoutubePlayer(
+              controller: _player,
+              showVideoProgressIndicator: false,
+              bufferIndicator: const Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
+            ),
           ),
-          Container(color: Colors.black.withAlpha(110)),
-          const CircularProgressIndicator(color: Colors.white),
-        ],
+        ),
       );
     }
 
     return Stack(
       alignment: Alignment.bottomCenter,
       children: [
-        if (fullscreen)
-          SizedBox.expand(child: ColoredBox(color: Colors.black, child: surface))
-        else
-          AspectRatio(aspectRatio: 16 / 9, child: ColoredBox(color: Colors.black, child: surface)),
+        ColoredBox(color: Colors.black, child: video),
         // translated subtitle overlay — sits on the video like burned-in subs
-        if (_showSubtitles && _activeIdx >= 0 && _playState == _PlayState.ready)
+        if (_showSubtitles && _activeIdx >= 0 && _playError == 0)
           Padding(
-            padding: EdgeInsets.only(bottom: fullscreen ? 56.0 : 44.0),
+            padding: EdgeInsets.only(bottom: _controlsVisible ? 52.0 : 10.0),
             child: _SubtitleOverlay(
               segment: _result.segments[_activeIdx],
               showSource: _showSource,
             ),
           ),
-        // controls
-        if (_playState == _PlayState.ready && (_controlsVisible || !_isPlaying))
-          _ControlBar(state: this, fullscreen: fullscreen),
-        if (fullscreen)
+        // custom control bar
+        if (_playError == 0 && (_controlsVisible || !_player.value.isPlaying))
+          _ControlBar(state: this),
+        if (_fullscreen)
           Positioned(
             top: 8, left: 8,
             child: IconButton(
-              onPressed: _exitFullscreen,
+              onPressed: _toggleFullscreen,
               icon: const Icon(Icons.close, color: Colors.white),
             ),
           ),
@@ -514,12 +496,11 @@ class _VideoScreenState extends State<VideoScreen> {
   }
 }
 
-/// bottom control bar — play/pause, time, scrub bar, mute, fullscreen
+/// bottom control bar — play/pause, time, scrub slider, mute, fullscreen.
+/// Rebuilds only via the controller's ValueNotifier (not whole-screen setState).
 class _ControlBar extends StatelessWidget {
   final _VideoScreenState _state;
-  final bool fullscreen;
-  const _ControlBar({required _VideoScreenState state, this.fullscreen = false})
-      : _state = state;
+  const _ControlBar({required _VideoScreenState state}) : _state = state;
 
   String _fmt(Duration d) {
     final h = d.inHours;
@@ -530,9 +511,6 @@ class _ControlBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final vc = _state._vc;
-    if (vc == null) return const SizedBox.shrink();
-    final v = vc.value;
     return GestureDetector(
       onTap: _state._pokeControls,
       child: Container(
@@ -542,50 +520,71 @@ class _ControlBar extends StatelessWidget {
             colors: [Colors.transparent, Colors.black54],
           ),
         ),
-        padding: const EdgeInsets.fromLTRB(8, 24, 8, 6),
+        padding: const EdgeInsets.fromLTRB(4, 24, 4, 2),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Row(
-              children: [
-                IconButton(
-                  onPressed: _state._togglePlay,
-                  icon: Icon(
-                    _state._isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill,
-                    color: Colors.white, size: fullscreen ? 34 : 28,
-                  ),
-                ),
-                Text('${_fmt(v.position)} / ${_fmt(v.duration)}',
-                    style: const TextStyle(color: Colors.white, fontSize: 11.5)),
-                const Spacer(),
-                IconButton(
-                  onPressed: _state._toggleMute,
-                  icon: Icon(
-                    _state._muted ? Icons.volume_off : Icons.volume_up,
-                    color: Colors.white, size: 20,
-                  ),
-                ),
-                IconButton(
-                  onPressed: _state._toggleFullscreen,
-                  icon: Icon(
-                    fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                    color: Colors.white, size: 24,
-                  ),
-                ),
-              ],
-            ),
-            SizedBox(
-              height: 22,
-              child: VideoProgressIndicator(
-                vc,
-                allowScrubbing: true,
-                padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-                colors: const VideoProgressColors(
-                  playedColor: Color(0xFFFF3D3D),
-                  bufferedColor: Color(0x55FFFFFF),
-                  backgroundColor: Color(0x22FFFFFF),
-                ),
-              ),
+            ValueListenableBuilder<YoutubePlayerValue>(
+              valueListenable: _state._player,
+              builder: (context, v, _) {
+                final durMs = v.metaData.duration.inMilliseconds;
+                final posMs = v.position.inMilliseconds;
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          onPressed: _state._togglePlay,
+                          icon: Icon(
+                            v.isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill,
+                            color: Colors.white, size: 28,
+                          ),
+                        ),
+                        Text(
+                          '${_fmt(v.position)} / ${_fmt(v.metaData.duration)}',
+                          style: const TextStyle(color: Colors.white, fontSize: 11.5),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          onPressed: _state._toggleMute,
+                          icon: Icon(
+                            _state._muted ? Icons.volume_off : Icons.volume_up,
+                            color: Colors.white, size: 20,
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: _state._toggleFullscreen,
+                          icon: const Icon(Icons.fullscreen, color: Colors.white, size: 24),
+                        ),
+                      ],
+                    ),
+                    SizedBox(
+                      height: 22,
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 2.5,
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                          overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                          padding: EdgeInsets.zero,
+                        ),
+                        child: Slider(
+                          value: durMs > 0
+                              ? posMs.clamp(0, durMs).toDouble()
+                              : 0,
+                          max: durMs > 0 ? durMs.toDouble() : 1,
+                          activeColor: const Color(0xFFFF3D3D),
+                          inactiveColor: Colors.white24,
+                          onChanged: (val) {
+                            _state._player.seekTo(Duration(milliseconds: val.round()));
+                            _state._armControlsHide();
+                          },
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
           ],
         ),
@@ -643,14 +642,14 @@ class _SubtitleOverlay extends StatelessWidget {
   }
 }
 
-/// Shown only when the video genuinely can't play (deleted / age-gated /
-/// copyright) — with retry. Subtitles still work; playback failure is no
-/// longer tied to the iframe's embed permission.
+/// Only shown when the video genuinely can't play (deleted / html5 error).
+/// With the original's youtube-nocookie origin, embed-block errors (101/150)
+/// should never appear — every video plays in-app like the original.
 class _PlayerErrorCard extends StatelessWidget {
   final String videoId;
   final String message;
   final Future<void> Function() onOpenYouTube;
-  final Future<void> Function() onRetry;
+  final VoidCallback onRetry;
   const _PlayerErrorCard({
     required this.videoId,
     required this.message,
@@ -691,7 +690,7 @@ class _PlayerErrorCard extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     FilledButton.tonalIcon(
-                      onPressed: () => onRetry(),
+                      onPressed: onRetry,
                       icon: const Icon(Icons.refresh, size: 17),
                       label: const Text('تلاش دوباره'),
                       style: FilledButton.styleFrom(

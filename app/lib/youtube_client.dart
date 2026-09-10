@@ -42,26 +42,11 @@ class YtVideo {
   });
 }
 
-/// Direct playback info — this is how the app plays ALL videos (including
-/// ones whose embedding is disabled, where the old iframe player showed
-/// "Watch on YouTube"): we mint the same stream URLs YouTube's own mobile
-/// apps get from innertube and feed them to a native player (ExoPlayer).
-class YtStream {
-  final String url;
-  final bool isHls; // true → HLS master playlist, false → progressive mp4
-  final int expiresInSeconds;
-  YtStream({required this.url, required this.isHls, this.expiresInSeconds = 21540});
-}
-
 class YouTubeClient {
   static const _ua =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
   static const _iosUa =
       'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)';
-
-  /// UA to use when downloading the streams themselves (must look like the
-  /// client that minted them, same trick as the timedtext fetch).
-  static const playbackUa = _iosUa;
   static const _androidUa =
       'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip';
 
@@ -110,124 +95,6 @@ class YouTubeClient {
     if (innertube != null) return innertube;
 
     throw YtFetchException('transcript_fetch_failed');
-  }
-
-  /// Direct stream playback info — device-side, exactly like YouTube's own
-  /// mobile apps. This is the "plays every video" mechanism:
-  ///
-  ///   1. innertube /player with the IOS client → streamingData.hlsManifestUrl
-  ///      (adaptive HLS up to 4K — this is what the iOS app streams)
-  ///   2. ANDROID_VR client → muxed progressive itag (360p) fallback
-  ///
-  /// Because the request comes from the device's own IP, the minted URLs are
-  /// valid for this device — no embed/iframe involved, so "embedding disabled"
-  /// videos play fine too.
-  Future<YtStream> fetchStreamInfo(String videoId) async {
-    final clients = [
-      {
-        'ctx': {
-          'clientName': 'IOS',
-          'clientVersion': '20.10.4',
-          'deviceMake': 'Apple',
-          'deviceModel': 'iPhone16,2',
-          'osName': 'iPhone',
-          'osVersion': '18.1.0.22B83',
-          'hl': 'en',
-          'gl': 'US',
-          'timeZone': 'UTC',
-          'utcOffsetMinutes': 0,
-        },
-        'headers': const {
-          'User-Agent': _iosUa,
-          'X-YouTube-Client-Name': '5',
-          'X-YouTube-Client-Version': '20.10.4',
-        },
-      },
-      {
-        'ctx': {
-          'clientName': 'ANDROID_VR',
-          'clientVersion': '1.60.19',
-          'deviceMake': 'Oculus',
-          'deviceModel': 'Quest 3',
-          'osName': 'Android',
-          'osVersion': '12',
-          'androidSdkVersion': 31,
-          'hl': 'en',
-          'gl': 'US',
-        },
-        'headers': const {
-          'User-Agent':
-              'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; eureka-user Build/SQ3A.220605.009.A1) gzip',
-          'X-YouTube-Client-Name': '28',
-          'X-YouTube-Client-Version': '1.60.19',
-        },
-      },
-    ];
-
-    for (final c in clients) {
-      try {
-        final res = await http.post(
-          Uri.parse('https://www.youtube.com/youtubei/v1/player?prettyPrint=false'),
-          headers: {'Content-Type': 'application/json', ...(c['headers'] as Map<String, String>)},
-          body: jsonEncode({
-            'context': {'client': c['ctx']},
-            'videoId': videoId,
-            'contentCheckOk': true,
-            'racyCheckOk': true,
-          }),
-        ).timeout(const Duration(seconds: 10));
-        if (res.statusCode != 200) continue;
-        final pr = jsonDecode(res.body) as Map<String, dynamic>;
-
-        final ps = (pr['playabilityStatus'] ?? {}) as Map<String, dynamic>;
-        final status = (ps['status'] ?? '').toString();
-        if (status == 'LIVE_STREAM_OFFLINE') throw YtFetchException('video_is_live');
-        if (status == 'LOGIN_REQUIRED') {
-          final reason = (ps['reason'] ?? '').toString().toLowerCase();
-          if (reason.contains('age')) throw YtFetchException('age_restricted');
-          continue; // bot-gate on this client → try next client
-        }
-        if (status == 'ERROR') {
-          final reason = (ps['reason'] ?? '').toString().toLowerCase();
-          if (reason.contains('copyright')) throw YtFetchException('copyright_blocked');
-          if (reason.contains('unavailable') ||
-              reason.contains('not found') ||
-              reason.contains('removed')) {
-            throw YtFetchException('video_not_found');
-          }
-          throw YtFetchException('video_unavailable');
-        }
-        if (status != 'OK') continue;
-
-        final sd = (pr['streamingData'] ?? {}) as Map<String, dynamic>;
-        final hls = (sd['hlsManifestUrl'] ?? '').toString();
-        if (hls.isNotEmpty) {
-          return YtStream(url: hls, isHls: true);
-        }
-        // progressive muxed fallback (ANDROID_VR/ANDROID give itag 18/22)
-        final formats = (sd['formats'] as List?) ?? const [];
-        String? best;
-        int bestItag = 0;
-        for (final f in formats) {
-          final fm = f as Map<String, dynamic>;
-          final url = (fm['url'] ?? '').toString();
-          final itag = (fm['itag'] ?? 0) as int;
-          if (url.isEmpty) continue;
-          if (itag == 22 || itag == 18) {
-            if (itag > bestItag) {
-              best = url;
-              bestItag = itag;
-            }
-          }
-        }
-        if (best != null) return YtStream(url: best, isHls: false);
-      } on YtFetchException {
-        rethrow;
-      } catch (_) {
-        continue;
-      }
-    }
-    throw YtFetchException('playback_failed');
   }
 
   // ---- method 1: watch page -------------------------------------------------
