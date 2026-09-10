@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 import '../api_client.dart';
@@ -26,6 +27,7 @@ class _VideoScreenState extends State<VideoScreen> {
   bool _switching = false;
   int _activeIdx = -1;
   int _activeHint = 0;
+  YoutubeError _playerError = YoutubeError.none;
 
   YoutubePlayerController? _player;
 
@@ -47,6 +49,14 @@ class _VideoScreenState extends State<VideoScreen> {
       ),
     );
     c.cueVideoById(videoId: _result.videoId);
+    // surface player errors (non-embeddable, not-found, html5) so we can
+    // swap in our own error card instead of YouTube's "Watch on YouTube" UI
+    c.listen((value) {
+      if (!mounted) return;
+      if (value.hasError && _playerError == YoutubeError.none) {
+        setState(() => _playerError = value.error);
+      }
+    });
     c.videoStateStream.listen((state) {
       if (!mounted) return;
       final posMs = state.position.inMilliseconds;
@@ -91,6 +101,12 @@ class _VideoScreenState extends State<VideoScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(friendlyError(e.code))));
       }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('تغییر زبان ناموفق بود؛ دوباره تلاش کن.')),
+        );
+      }
     } finally {
       if (mounted) setState(() => _switching = false);
     }
@@ -117,9 +133,40 @@ class _VideoScreenState extends State<VideoScreen> {
   }
 
   void _seekTo(Segment s) {
+    if (_playerError != YoutubeError.none) return;
     final seconds = s.start / 1000.0;
     _player?.seekTo(seconds: seconds, allowSeekAhead: true);
     _player?.playVideo();
+  }
+
+  Future<void> _openInYouTube() async {
+    final uri = Uri.parse('https://www.youtube.com/watch?v=${_result.videoId}');
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('برنامه یوتیوب یا مرورگر پیدا نشد.')),
+        );
+      }
+    }
+  }
+
+  String get _playerErrorMessage {
+    switch (_playerError) {
+      case YoutubeError.notEmbeddable:
+      case YoutubeError.sameAsNotEmbeddable:
+        return 'سازنده این ویدئو اجازه پخش داخل اپ را نداده است.';
+      case YoutubeError.videoNotFound:
+      case YoutubeError.cannotFindVideo:
+        return 'ویدئو پیدا نشد یا حذف شده است.';
+      case YoutubeError.invalidParam:
+        return 'ویدئوی موردنظر معتبر نیست.';
+      case YoutubeError.html5Error:
+        return 'پخش‌کننده ویدئو خطا داد؛ دوباره تلاش کن.';
+      default:
+        return 'پخش این ویدئو در اپ ممکن نیست؛ زیرنویس همچنان کار می‌کند.';
+    }
   }
 
   @override
@@ -145,7 +192,7 @@ class _VideoScreenState extends State<VideoScreen> {
           : Column(
               children: [
                 // --- embedded player with synced subtitle overlay ---
-                if (player != null)
+                if (player != null && _playerError == YoutubeError.none)
                   Stack(
                     alignment: Alignment.bottomCenter,
                     children: [
@@ -156,6 +203,12 @@ class _VideoScreenState extends State<VideoScreen> {
                           showSource: _showSource,
                         ),
                     ],
+                  )
+                else if (_playerError != YoutubeError.none)
+                  _PlayerErrorCard(
+                    videoId: _result.videoId,
+                    message: _playerErrorMessage,
+                    onOpenYouTube: _openInYouTube,
                   )
                 else
                   AspectRatio(
@@ -334,6 +387,77 @@ class _SubtitleOverlay extends StatelessWidget {
               height: 1.4,
               fontWeight: FontWeight.w600,
               shadows: [Shadow(blurRadius: 4, color: Colors.black)],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Replaces the broken iframe (embedding disabled / playback error) so users
+/// never see YouTube's own error card or its black "Watch on YouTube" screen.
+class _PlayerErrorCard extends StatelessWidget {
+  final String videoId;
+  final String message;
+  final Future<void> Function() onOpenYouTube;
+  const _PlayerErrorCard({
+    required this.videoId,
+    required this.message,
+    required this.onOpenYouTube,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.network(
+            'https://i.ytimg.com/vi/$videoId/hqdefault.jpg',
+            fit: BoxFit.cover,
+            errorBuilder: (_, __, ___) => Container(color: Colors.black),
+          ),
+          Container(color: Colors.black.withAlpha(140)),
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.videocam_off, color: Colors.white70, size: 34),
+                const SizedBox(height: 8),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.5),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.tonalIcon(
+                  onPressed: () => onOpenYouTube(),
+                  icon: const Icon(Icons.open_in_new, size: 17),
+                  label: const Text('باز کردن در یوتیوب'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.white.withAlpha(230),
+                    foregroundColor: Colors.black87,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            top: 6,
+            left: 6,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: cs.surface.withAlpha(200),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text('زیرنویس فعال است', style: TextStyle(fontSize: 10.5, color: cs.onSurface)),
             ),
           ),
         ],

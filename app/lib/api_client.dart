@@ -94,17 +94,35 @@ class Api {
   /// Translate a batch of segment texts via the Worker
   /// (Gemini primary → gtx fallback, same engine chain as the original).
   Future<List<String>> translateTexts(List<String> texts, String target) async {
-    final res = await http.post(
-      Uri.parse('$baseUrl/?action=translate'),
-      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-      body: jsonEncode({'texts': texts, 'target': target}),
-    ).timeout(const Duration(seconds: 110));
-    final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
-    if (j.containsKey('error')) {
-      final e = j['error'] as Map<String, dynamic>;
-      throw ApiException((e['code'] ?? '').toString(), friendlyError((e['code'] ?? '').toString()));
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 800));
+      }
+      try {
+        final res = await http.post(
+          Uri.parse('$baseUrl/?action=translate'),
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+          body: jsonEncode({'texts': texts, 'target': target}),
+        ).timeout(const Duration(seconds: 90));
+        final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+        if (j.containsKey('error')) {
+          final e = j['error'] as Map<String, dynamic>;
+          final code = (e['code'] ?? '').toString();
+          if (code == 'translation_failed' && attempt < 1) {
+            lastError = ApiException(code, friendlyError(code));
+            continue;
+          }
+          throw ApiException(code, friendlyError(code));
+        }
+        return ((j['segments'] as List?) ?? []).map((s) => s.toString()).toList();
+      } on ApiException {
+        rethrow;
+      } catch (e) {
+        lastError = e;
+      }
     }
-    return ((j['segments'] as List?) ?? []).map((s) => s.toString()).toList();
+    throw lastError ?? ApiException('translation_failed', friendlyError('translation_failed'));
   }
 
   Future<Map<String, String>> availableLanguages(String videoId) async {
@@ -153,33 +171,49 @@ class Api {
   }
 
   Future<Map<String, dynamic>> _get(Uri uri) async {
-    try {
-      final res = await http.get(uri, headers: {'Accept': 'application/json'}).timeout(
-        const Duration(seconds: 90),
-      );
-      if (res.statusCode >= 500) {
-        throw ApiException('server_error', 'خطای سرور (${res.statusCode})');
+    // YouTube bot-gates server IPs probabilistically — a 5xx often succeeds
+    // on retry, so we retry twice with a short backoff before giving up.
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await Future<void>.delayed(Duration(milliseconds: 700 * attempt));
       }
-      final j = json.decode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
-      if (j.containsKey('error')) {
-        final e = j['error'] as Map<String, dynamic>;
-        throw ApiException(
-          (e['code'] ?? '').toString(),
-          friendlyError((e['code'] ?? '').toString()),
+      try {
+        final res = await http.get(uri, headers: {'Accept': 'application/json'}).timeout(
+          const Duration(seconds: 75),
         );
+        if (res.statusCode >= 500) {
+          lastError = ApiException(
+              'server_error', 'یوتیوب درخواست را محدود کرده؛ دوباره تلاش کن.');
+          continue;
+        }
+        final j = json.decode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+        if (j.containsKey('error')) {
+          final e = j['error'] as Map<String, dynamic>;
+          final code = (e['code'] ?? '').toString();
+          // server-side transient failures are worth one more round
+          if (code == 'transcript_fetch_failed' && attempt < 2) {
+            lastError = ApiException(code, friendlyError(code));
+            continue;
+          }
+          throw ApiException(code, friendlyError(code));
+        }
+        return j;
+      } on ApiException {
+        rethrow;
+      } catch (_) {
+        lastError = ApiException('network', 'اتصال به سرور برقرار نشد. اینترنت را بررسی کن.');
       }
-      return j;
-    } on ApiException {
-      rethrow;
-    } catch (_) {
-      throw ApiException('network', 'اتصال به سرور برقرار نشد. اینترنت را بررسی کن.');
     }
+    throw lastError ?? ApiException('network', 'اتصال برقرار نشد.');
   }
 }
 
 /// Categorized error keys — same taxonomy as the original app.
 String friendlyError(String code) {
   switch (code) {
+    case 'server_error':
+      return 'یوتیوب درخواست را محدود کرده؛ چند لحظه بعد دوباره تلاش کن.';
     case 'video_not_found':
       return 'ویدئو پیدا نشد یا حذف شده است.';
     case 'video_is_live':

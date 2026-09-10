@@ -193,16 +193,39 @@ async function tryClient(c, videoId) {
 
 // Returns { j, client } — client is kept so the caption download can reuse
 // the SAME User-Agent that minted the baseUrl (timedtext is UA-sensitive).
+// YouTube bot-gates datacenter IPs PROBABILISTICALLY (same video often
+// succeeds on retry), so we run parallel fan-out passes over all clients —
+// parallel keeps the wall-clock low while preserving the retry effect.
+const ROUNDS = 2;
+
+function shuffled(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function getPlayerResponse(videoId) {
   let watchFallback = null;
   let watchClient = null;
-  for (const c of CLIENTS) {
-    const r = await tryClient(c, videoId);
-    if (r.j && r.hasCaptions) return { j: r.j, client: c };
-    if (r.j && r.hasDetails && !watchFallback) {
-      watchFallback = r.j;
-      watchClient = c;
+
+  for (let round = 0; round < ROUNDS; round++) {
+    const results = await Promise.all(shuffled(CLIENTS).map((c) => tryClient(c, videoId)));
+    for (const r of results) {
+      if (r.j && r.hasCaptions) {
+        const c = CLIENTS.find((x) => x.name === r.client);
+        return { j: r.j, client: c };
+      }
+      if (r.j && r.hasDetails && !watchFallback) {
+        watchFallback = r.j;
+        watchClient = CLIENTS.find((x) => x.name === r.client);
+      }
     }
+    if (round < ROUNDS - 1) await sleep(250 + Math.floor(Math.random() * 250));
   }
 
   // Watch page fallback
@@ -592,10 +615,12 @@ async function fetchTranscriptSegments(win, videoId, wantLang) {
   if (first) return first;
 
   // 2) fresh player responses from the remaining clients (each UA-bound)
-  for (const c of CLIENTS) {
-    if (triedClients.has(c.name)) continue;
+  const rest = CLIENTS.filter((c) => !triedClients.has(c.name));
+  const fanout = await Promise.all(
+    rest.map(async (c) => ({ c, r: await tryClient(c, videoId) }))
+  );
+  for (const { c, r } of fanout) {
     triedClients.add(c.name);
-    const r = await tryClient(c, videoId);
     if (!r.j || !r.hasCaptions) continue;
     const segs = await attemptTracks(r.j, c.headers["User-Agent"]);
     if (segs) return segs;
@@ -763,19 +788,44 @@ export default {
       const hit = await cache.match(cacheKey);
       if (hit) return hit;
 
-      const win = await getPlayerResponse(videoId);
-      const pr = win?.j;
-      if (!pr) return err("transcript_fetch_failed", 502, "Could not fetch player response");
-      const pe = playabilityError(pr);
-      if (pe) return err(pe, 422, "Video cannot be transcribed");
-      const { track, hasAny } = pickTrack(pr, wantLang);
-      if (!track || !hasAny)
-        return err("no_speech", 422, "No captions/transcript available for this video");
+      const sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+      // Definitive video errors fail fast; YouTube bot-gating is retried.
+      const DEFINITIVE = new Set([
+        "video_not_found", "video_is_live", "age_restricted",
+        "copyright_blocked", "video_unavailable", "no_speech",
+      ]);
 
-      let segments;
-      try {
-        segments = await fetchTranscriptSegments(win, videoId, wantLang);
-      } catch (e) {
+      let win = null, pr = null, pe = null, track = null, hasAny = false;
+      let segments = null, hardErr = null;
+      for (let attempt = 0; attempt < 2 && !segments; attempt++) {
+        if (attempt > 0) await sleep2(500 + Math.floor(Math.random() * 400));
+        win = await getPlayerResponse(videoId);
+        pr = win?.j;
+        if (!pr) { hardErr = "player"; continue; }
+        pe = playabilityError(pr);
+        if (pe && DEFINITIVE.has(pe)) break; // fail fast, no retry
+        if (pe) { hardErr = "playability"; continue; }
+        const pick = pickTrack(pr, wantLang);
+        track = pick.track; hasAny = pick.hasAny;
+        if (!track || !hasAny) {
+          // only a genuinely-OK response with zero tracks means "no captions";
+          // gated/blocked responses must keep retrying instead
+          if (!pe) { hardErr = "no_speech"; break; }
+          hardErr = "playability";
+          continue;
+        }
+        try {
+          segments = await fetchTranscriptSegments(win, videoId, wantLang);
+        } catch (e) {
+          hardErr = "captions"; // retry once
+        }
+      }
+
+      if (!segments) {
+        if (pe && DEFINITIVE.has(pe))
+          return err(pe, 422, "Video cannot be transcribed");
+        if (hardErr === "no_speech" && pe === null)
+          return err("no_speech", 422, "No captions/transcript available for this video");
         return err("transcript_fetch_failed", 502, "Caption download failed");
       }
       if (!segments.length) return err("no_speech", 422, "Empty transcript");

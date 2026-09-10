@@ -64,7 +64,7 @@ class YouTubeClient {
       final meta = await http.get(
         Uri.parse('https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json'),
         headers: {'User-Agent': _ua},
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 8));
       if (meta.statusCode == 200) {
         final m = jsonDecode(meta.body) as Map<String, dynamic>;
         title = (m['title'] ?? '').toString();
@@ -102,7 +102,7 @@ class YouTubeClient {
     final res = await http.get(
       Uri.parse('https://www.youtube.com/watch?v=$videoId&hl=en&has_verified=1'),
       headers: _browserHeaders,
-    ).timeout(const Duration(seconds: 25));
+    ).timeout(const Duration(seconds: 12));
     if (res.statusCode != 200) throw YtFetchException('transcript_fetch_failed');
 
     final body = res.body;
@@ -195,7 +195,7 @@ class YouTubeClient {
             'contentCheckOk': true,
             'racyCheckOk': true,
           }),
-        ).timeout(const Duration(seconds: 20));
+        ).timeout(const Duration(seconds: 10));
         if (res.statusCode != 200) continue;
         final pr = jsonDecode(res.body) as Map<String, dynamic>;
         final tracks = (((pr['captions'] ?? {}) as Map)['playerCaptionsTracklistRenderer'] ?? {})
@@ -236,7 +236,7 @@ class YouTubeClient {
         final res = await http.get(
           Uri.parse(u),
           headers: {'User-Agent': ua, 'Referer': 'https://www.youtube.com/', ...?extraHeaders},
-        ).timeout(const Duration(seconds: 20));
+        ).timeout(const Duration(seconds: 10));
         if (res.statusCode != 200) continue;
         final body = res.body.trim();
         if (body.isEmpty) continue;
