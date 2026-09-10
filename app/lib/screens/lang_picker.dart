@@ -9,12 +9,13 @@ Future<Lang?> showLanguagePicker(BuildContext context, Lang current) {
     context: context,
     isScrollControlled: true,
     showDragHandle: true,
-    builder: (context) => const _LangPicker(),
+    builder: (context) => _LangPicker(current),
   );
 }
 
 class _LangPicker extends StatefulWidget {
-  const _LangPicker();
+  final Lang current;
+  const _LangPicker(this.current);
   @override
   State<_LangPicker> createState() => _LangPickerState();
 }
@@ -66,7 +67,7 @@ class _LangPickerState extends State<_LangPicker> {
               itemCount: results.length,
               itemBuilder: (context, i) {
                 final l = results[i];
-                final selected = l.code == current.code;
+                final selected = l.code == widget.current.code;
                 return ListTile(
                   leading: Text(l.flag, style: const TextStyle(fontSize: 22)),
                   title: Text(l.fa,

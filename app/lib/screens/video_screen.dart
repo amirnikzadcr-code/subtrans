@@ -70,7 +70,7 @@ class _VideoScreenState extends State<VideoScreen> {
     for (final s in _result.segments) {
       buf.writeln('${s.tc}  ${s.tr.isEmpty ? s.text : s.tr}');
     }
-    SharePlus.instance.share(ShareParams(text: buf.toString()));
+    Share.share(buf.toString());
   }
 
   @override
