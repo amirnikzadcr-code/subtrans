@@ -79,11 +79,19 @@ jobs:
           body: |
             ## SubTrans — YouTube subtitle translation (130+ languages)
 
-            **What's new**
-            - 🎬 Plays EVERY video in-app now — switched to the exact playback stack of the original app (YouTube IFrame player served from youtube-nocookie.com origin). "Watch on YouTube" / "embedding disabled" errors are gone.
-            - Fullscreen mode (rotate or tap the button), scrub bar, mute, auto-hiding controls
-            - Synced translated subtitles burned on top of the video
-            - Tap any transcript line to seek the video
+            **What's new in this build**
+            - 🎬 **NATIVE playback engine** — videos now play through a real video player
+              (ExoPlayer) using direct stream URLs extracted from YouTube's own mobile
+              player API on your device. No more iframe → **every video plays in-app**,
+              even ones that show "the uploader doesn't allow embedding". There is no
+              "Watch on YouTube" path anymore — it cannot appear.
+            - ⚡ Faster video start (one API call → adaptive HLS stream, up to 1080p)
+            - 🔄 Language switch now actually re-translates subtitles instantly
+            - 🔎 New YouTube **search tab** — search any topic, subtitle any result
+            - ✨ **AI summary** of every video (Persian + 130 languages)
+            - 🎨 UI matched to the original app (fonts: Inter Display + IBM Plex Sans
+              Arabic, YouTube-red dark theme)
+            - Friendly Persian error messages + retry buttons
 
             **Install**: download `SubTrans-v*.apk`, allow "install unknown apps", install.
             Requires YouTube access (VPN in restricted regions).

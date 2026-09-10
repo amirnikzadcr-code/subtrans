@@ -746,12 +746,14 @@ export default {
     
     
     
-    if (!["youtube_asr", "youtube_asr_languages", "translate"].includes(action)) {
+    if (!["youtube_asr", "youtube_asr_languages", "translate", "summarize", "stream"].includes(action)) {
       return err("missing_or_invalid_action", 400, 'Unknown "action" parameter');
     }
     const videoId =
-      action === "translate" ? "" : parseVideoId(v || url.searchParams.get("url") || "");
-    if (action !== "translate" && !videoId)
+      action === "translate" || action === "summarize"
+        ? ""
+        : parseVideoId(v || url.searchParams.get("url") || "");
+    if (action !== "translate" && action !== "summarize" && !videoId)
       return err("invalid_video_url", 400, "Could not parse a YouTube video id");
 
     // --- youtube_asr_languages: list available caption languages
@@ -887,6 +889,84 @@ export default {
         return ok({ engine, target, segments });
       } catch (e) {
         return err("translation_failed", 502, "Translation engine failed");
+      }
+    }
+
+    // --- stream: server-side playback fallback (some videos pass from
+    // Cloudflare IPs when they are gated elsewhere) — HLS / muxed URLs
+    if (action === "stream") {
+      const win = await getPlayerResponse(videoId);
+      const pr = win?.j;
+      if (!pr) return err("playback_failed", 502, "No player response");
+      const ps = pr.playabilityStatus || {};
+      if (ps.status && ps.status !== "OK") {
+        const pe = playabilityError(pr);
+        return err(pe || "playback_failed", pe ? 422 : 502, ps.reason || "Not playable");
+      }
+      const sd = pr.streamingData || {};
+      let muxed = "", muxedItag = 0;
+      for (const f of sd.formats || []) {
+        if (!f.url) continue;
+        if (f.itag === 22 || f.itag === 18) {
+          if (f.itag > muxedItag) { muxed = f.url; muxedItag = f.itag; }
+        }
+      }
+      const hls = (sd.hlsManifestUrl || "").toString();
+      if (!hls && !muxed) return err("playback_failed", 502, "No playable stream in response");
+      return ok({
+        video_id: videoId,
+        hls,
+        muxed,
+        muxed_itag: muxedItag,
+        client: win?.client || "",
+      });
+    }
+
+    // --- summarize: AI summary of a transcript (Gemini)
+    if (action === "summarize") {
+      if (request.method !== "POST")
+        return err("method_not_allowed", 405, "Use POST with JSON body");
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return err("invalid_body", 400, "Body must be JSON");
+      }
+      const text = (body.text || "").toString();
+      const title = (body.title || "").toString();
+      const target = normalizeLang(body.target || "en");
+      if (text.trim().length < 40)
+        return err("invalid_body", 400, "Text too short to summarize");
+      if (!env.GEMINI_API_KEY)
+        return err("summarize_failed", 502, "Summarizer unavailable");
+      const clipped = text.length > 14000 ? text.slice(0, 14000) : text;
+      const sys =
+        `You summarize YouTube video transcripts. Write a clear, well-structured summary IN ${target}. ` +
+        `Format: a 2-4 sentence overview paragraph, then a short "نکات کلیدی:" (key points) list with 3-6 bullets. ` +
+        `Keep it under 220 words total. No preamble, no explanations about yourself.`;
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: sys }] },
+              contents: [
+                { role: "user", parts: [{ text: (title ? `Title: ${title}\n\n` : "") + clipped }] },
+              ],
+              generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
+            }),
+          }
+        );
+        if (!res.ok) throw new Error("gemini_http_" + res.status);
+        const j = await res.json();
+        const sum =
+          j.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim() || "";
+        if (!sum) throw new Error("empty");
+        return ok({ summary: sum });
+      } catch (e) {
+        return err("summarize_failed", 502, "Summarizer failed");
       }
     }
 
