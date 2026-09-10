@@ -24,6 +24,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: 3.35.3
           channel: stable
           cache: true
 
@@ -33,6 +34,10 @@ jobs:
       - name: Generate Android platform scaffold
         working-directory: app
         run: flutter create . --platforms=android --org com.subtrans --project-name subtrans
+
+      - name: Remove generated boilerplate test
+        working-directory: app
+        run: rm -rf test
 
       - name: Patch Android manifest (INTERNET + label)
         working-directory: app
